@@ -44,10 +44,10 @@ typedef NS_ENUM(NSUInteger, MTRCommissioningFlow) {
 
 typedef NS_ENUM(NSUInteger, MTROptionalQRCodeInfoType) {
     MTROptionalQRCodeInfoTypeUnknown MTR_DEPRECATED("The type is never actually unknown", ios(16.1, 16.4), macos(13.0, 13.3),
-                                                    watchos(9.1, 9.4), tvos(16.1, 16.4)),
+        watchos(9.1, 9.4), tvos(16.1, 16.4)),
     MTROptionalQRCodeInfoTypeString,
     MTROptionalQRCodeInfoTypeInt32 MTR_DEPRECATED_WITH_REPLACEMENT("MTROptionalQRCodeInfoTypeSignedInt", ios(16.1, 26.0), macos(13.0, 26.0),
-                                                    watchos(9.1, 26.0), tvos(16.1, 26.0)),
+        watchos(9.1, 26.0), tvos(16.1, 26.0)),
     MTROptionalQRCodeInfoTypeSignedInt,
     MTROptionalQRCodeInfoTypeUnsignedInt,
 };
