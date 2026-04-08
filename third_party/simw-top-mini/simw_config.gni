@@ -44,5 +44,5 @@ import("//build_overrides/build.gni")
 declare_args() {
   chip_se05x_smcom = "t=1oi2c"
   chip_se05x_auth = "none"
-  chip_se05x_host_gpio = "none"
+  chip_se05x_host_gpio = "frdm_imx93"
 }

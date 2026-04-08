@@ -39,12 +39,17 @@
 #include <lib/support/CHIPMem.h>
 #include <lib/support/ScopedBuffer.h>
 #include <lib/support/TestGroupData.h>
+#include <setup_payload/OnboardingCodesUtil.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
+#include <setup_payload/QRCodeSetupPayloadParser.h>
 #include <setup_payload/SetupPayload.h>
 
 #include <platform/CommissionableDataProvider.h>
 #include <platform/DiagnosticDataProvider.h>
 #include <platform/RuntimeOptionsProvider.h>
+
+#include <platform/nxp/crypto/se05x/CHIPCryptoPALHsm_se05x_utils.h>
+#include <third_party/simw-top-mini/repo/demos/se051h_nfc_comm_prov/common/se051h_nfc_comm_prov.h>
 
 #include <AllClustersExampleDeviceInfoProviderImpl.h>
 #include <DeviceInfoProviderImpl.h>
@@ -318,17 +323,269 @@ LinuxCommissionableDataProvider gCommissionableDataProvider;
 chip::DeviceLayer::DeviceInfoProviderImpl gExampleDeviceInfoProvider;
 chip::DeviceLayer::AllClustersExampleDeviceInfoProviderImpl gAllClustersExampleDeviceInfoProvider;
 
+class SE05XSession
+{
+public:
+    ~SE05XSession()
+    {
+        ex_sss_session_close(&context);
+
+        ChipLogDetail(DeviceLayer, "Turn OFF SE05x secure element after session close");
+        if (se05x_host_gpio_power_set(0) != 0)
+        {
+            ChipLogError(DeviceLayer, "SE05x - Error in se05x_host_gpio_power_set(0) function");
+            return;
+        }
+    }
+
+    Se05xSession_t * Open()
+    {
+        ChipLogDetail(DeviceLayer, "Turn ON SE05x secure element before session open");
+        if (se05x_host_gpio_power_set(1) != 0)
+        {
+            ChipLogError(DeviceLayer, "SE05x - Error in se05x_host_gpio_power_set(1) function");
+            return nullptr;
+        }
+
+        char * portName     = nullptr;
+        sss_status_t status = ex_sss_boot_connectstring(0, NULL, &portName);
+        if (status != kStatus_SSS_Success)
+        {
+            ChipLogError(DeviceLayer, "se05x error: ex_sss_boot_connectstring failed");
+            return nullptr;
+        }
+
+        memset(&context, 0, sizeof(context));
+
+        status = ex_sss_boot_open(&context, portName);
+        if (status != kStatus_SSS_Success)
+        {
+            ChipLogError(DeviceLayer, "se05x error: ex_sss_boot_open failed");
+            return nullptr;
+        }
+
+        status = ex_sss_key_store_and_object_init(&context);
+        if (status != kStatus_SSS_Success)
+        {
+            ChipLogError(DeviceLayer, "se05x error: ex_sss_key_store_and_object_init failed");
+            return nullptr;
+        }
+
+        return &((sss_se05x_session_t *) &context)->s_ctx;
+    }
+
+private:
+    ex_sss_boot_ctx_t context;
+};
+
+void UpdateNfcTagWithDeviceId(const FabricInfo & fabric)
+{
+    chip::NodeId nodeId     = fabric.GetPeerId().GetNodeId();
+    chip::FabricId fabricId = fabric.GetFabricId();
+
+    SE05XSession session;
+    Se05xSession_t * context = session.Open();
+    if (!context)
+    {
+        return;
+    }
+
+    smStatus_t smStatus = Se05x_T4T_API_SelectT4TApplet(context);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: SelectT4TApplet failed: 0x%04x", smStatus);
+        return;
+    }
+
+    smStatus = Se05x_T4T_API_ConfigureAccessCtrl(context, kSE05x_T4T_Interface_Contactless, kSE05x_T4T_Operation_Write,
+                                                 kSE05x_T4T_AccessCtrl_Granted);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: ConfigureAccessCtrl (grant) failed: 0x%04x", smStatus);
+        return;
+    }
+
+    uint8_t ndefFileId[]           = NDEF_FILE_ID;
+    constexpr size_t ndefFileIdLen = sizeof(ndefFileId);
+
+    smStatus = Se05x_T4T_API_SelectFile(context, ndefFileId, ndefFileIdLen);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: SelectFile failed: 0x%04x", smStatus);
+        return;
+    }
+
+    uint8_t ndefData[256] = { 0 };
+    size_t ndefDataLen    = sizeof(ndefData);
+
+    smStatus = Se05x_T4T_API_ReadBinary(context, ndefData, &ndefDataLen);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: ReadBinary failed: 0x%04x", smStatus);
+        return;
+    }
+
+    constexpr uint8_t defaultNdefHeader[] = NDEF_HEADER;
+    constexpr size_t ndefHeaderLen        = sizeof(defaultNdefHeader);
+
+    if (ndefDataLen < ndefHeaderLen)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: NDEF data looks bad");
+        return;
+    }
+
+    uint8_t ndefHeader[ndefHeaderLen] = NDEF_HEADER;
+    memcpy(&ndefHeader, ndefData, ndefHeaderLen);
+
+    // NDEF format as read: { 0x00, length, 0xD1, 0x01, uriLength, 0x55, 0x00, 'M', 'T', ':', base38… }
+    static_assert(6 < sizeof(ndefHeader));
+
+    size_t length = ndefHeader[1];
+    if (ndefHeader[0] != defaultNdefHeader[0] || length + 2 != ndefDataLen)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: NDEF data looks bad");
+        return;
+    }
+
+    if (ndefHeader[2] != defaultNdefHeader[2] || ndefHeader[3] != defaultNdefHeader[3] || ndefHeader[4] != defaultNdefHeader[4] ||
+        ndefHeader[5] != defaultNdefHeader[5])
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: NDEF data looks bad");
+        return;
+    }
+
+    size_t uriLength = ndefHeader[4];
+    if (uriLength + 7 != ndefDataLen)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: NDEF data looks bad");
+        return;
+    }
+
+    std::string base38URI((const char *) &ndefData[7], uriLength);
+    // std::string base38URI("MT:-24J0EVQ20SWV917-00");
+    uint8_t ndefHeader[ndefHeaderLen] = NDEF_HEADER;
+
+    std::vector<SetupPayload> payloads;
+    CHIP_ERROR err = QRCodeSetupPayloadParser(base38URI).populatePayloads(payloads);
+    if (err != CHIP_NO_ERROR)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: Couldn't parse existing payload: %" CHIP_ERROR_FORMAT, err.Format());
+        return;
+    }
+
+    // FIXME Remove this once QRCodeSetupPayloadGenerator supports concatenated codes.
+    if (payloads.size() > 1)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: No support for generating concatenated QR codes");
+        return;
+    }
+
+    std::string qrCodes;
+    for (size_t i = 0; i < payloads.size(); ++i)
+    {
+        SetupPayload & payload = payloads[i];
+        if (!payload.isValidQRCodePayload())
+        {
+            ChipLogError(DeviceLayer, "UpdateNfcTag: Existing payloads contain invalid QR payload");
+            return;
+        }
+
+        OptionalQRCodeInfo info;
+        // FIXME Maybe it's ok to overwrite these?
+        if (payload.getOptionalVendorData(0xAA, info) != CHIP_ERROR_KEY_NOT_FOUND ||
+            payload.getOptionalVendorData(0xAB, info) != CHIP_ERROR_KEY_NOT_FOUND)
+        {
+            ChipLogError(DeviceLayer, "UpdateNfcTag: Found vendor data in existing QR payload");
+            return;
+        }
+
+        payload.addOptionalVendorData(0xAA, static_cast<uint64_t>(nodeId));
+        payload.addOptionalVendorData(0xAB, static_cast<uint64_t>(fabricId));
+
+        QRCodeSetupPayloadGenerator generator(payload);
+        // FIXME Enable this once QRCodeSetupPayloadGenerator supports concatenated codes.
+        // generator.SetAsConcatenation(i > 0);
+
+        std::string qrCode;
+        err = generator.payloadBase38RepresentationWithAutoTLVBuffer(qrCode);
+        if (err != CHIP_NO_ERROR)
+        {
+            ChipLogError(DeviceLayer, "UpdateNfcTag: QR code generation failed: %" CHIP_ERROR_FORMAT, err.Format());
+            return;
+        }
+        qrCodes.append(qrCode);
+    }
+
+    ChipLogProgress(DeviceLayer, "UpdateNfcTag: New QR code: %s (fabric id: %lX, node id: %lX)", qrCodes.c_str(),
+                    static_cast<uint64_t>(fabricId), static_cast<uint64_t>(nodeId));
+
+    const size_t qrCodesLen = qrCodes.length();
+    if (ndefHeaderLen + qrCodesLen > sizeof(ndefData))
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: NDEF data too large (%u bytes)",
+                     static_cast<unsigned>(ndefHeaderLen + qrCodesLen));
+        return;
+    }
+
+    ndefHeader[1] = static_cast<uint8_t>(qrCodesLen + 5);
+    ndefHeader[4] = static_cast<uint8_t>(qrCodesLen + 1);
+
+    memcpy(ndefData, ndefHeader, ndefHeaderLen);
+    memcpy(ndefData + ndefHeaderLen, qrCodes.c_str(), qrCodesLen);
+
+    smStatus = Se05x_T4T_API_ConfigureAccessCtrl(context, kSE05x_T4T_Interface_Contactless, kSE05x_T4T_Operation_Write,
+                                                 kSE05x_T4T_AccessCtrl_Granted);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: ConfigureAccessCtrl (grant) failed: 0x%04x", smStatus);
+        return;
+    }
+
+    smStatus = Se05x_T4T_API_UpdateBinary(context, ndefData, ndefHeaderLen + qrCodesLen);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: UpdateBinary failed: 0x%04x", smStatus);
+        return;
+    }
+
+    smStatus = Se05x_T4T_API_ConfigureAccessCtrl(context, kSE05x_T4T_Interface_Contactless, kSE05x_T4T_Operation_Write,
+                                                 kSE05x_T4T_AccessCtrl_Granted);
+    if (smStatus != SM_OK)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: ConfigureAccessCtrl (grant) failed: 0x%04x", smStatus);
+        return;
+    }
+
+    ChipLogProgress(DeviceLayer, "UpdateNfcTag: NFC tag updated with node ID and fabric ID");
+}
+
+void OnCommissioningComplete(const chip::DeviceLayer::ChipDeviceEvent * event)
+{
+    FabricIndex fabricIdx     = event->CommissioningComplete.fabricIndex;
+    const FabricInfo * fabric = Server::GetInstance().GetFabricTable().FindFabricWithIndex(fabricIdx);
+    if (fabric == nullptr)
+    {
+        ChipLogError(DeviceLayer, "UpdateNfcTag: fabric not found for index %u", fabricIdx);
+        return;
+    }
+    UpdateNfcTagWithDeviceId(*fabric);
+}
+
 void EventHandler(const DeviceLayer::ChipDeviceEvent * event, intptr_t arg)
 {
     (void) arg;
-    if (event->Type == DeviceLayer::DeviceEventType::kCHIPoBLEConnectionEstablished)
+    switch (event->Type)
     {
+    case DeviceLayer::DeviceEventType::kCHIPoBLEConnectionEstablished:
         ChipLogProgress(DeviceLayer, "Receive kCHIPoBLEConnectionEstablished");
-    }
-    else if ((event->Type == chip::DeviceLayer::DeviceEventType::kInternetConnectivityChange))
-    {
+        break;
+    case chip::DeviceLayer::DeviceEventType::kInternetConnectivityChange:
         // Restart the server on connectivity change
         app::DnssdServer::Instance().StartServer();
+        break;
+    case DeviceEventType::kCommissioningComplete:
+        OnCommissioningComplete(event);
+        break;
     }
 }
 
